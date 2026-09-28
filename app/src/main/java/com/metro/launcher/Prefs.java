@@ -41,6 +41,14 @@ final class Prefs {
         return c.getSharedPreferences("metro", Context.MODE_PRIVATE);
     }
 
+    private static boolean readBool(SharedPreferences p, String key, boolean def) {
+        try {
+            return p.getBoolean(key, def);
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
     static Prefs load(Context c) {
         SharedPreferences p = sp(c);
         Prefs s = new Prefs();
@@ -54,7 +62,9 @@ final class Prefs {
         s.accent = p.getInt("accent", 0xFF1BA1E2);
         s.monoIcons = p.getBoolean("monoIcons", false);
         s.tileAlpha = p.getInt("tileAlpha", 215);
-        s.dock = p.getBoolean("dock", false);
+        s.dock = readBool(p, "dockOn", false);
+        // Early builds stored two different values under "dock"; drop that key.
+        if (p.contains("dock")) p.edit().remove("dock").apply();
         s.compactDrawer = p.getBoolean("compactDrawer", false);
         s.bing = p.getBoolean("bing", true);
         s.bingMins = p.getInt("bingMins", 60);
@@ -81,7 +91,7 @@ final class Prefs {
                 .putInt("accent", accent)
                 .putBoolean("monoIcons", monoIcons)
                 .putInt("tileAlpha", tileAlpha)
-                .putBoolean("dock", dock)
+                .putBoolean("dockOn", dock)
                 .putBoolean("compactDrawer", compactDrawer)
                 .putBoolean("bing", bing)
                 .putInt("bingMins", bingMins)

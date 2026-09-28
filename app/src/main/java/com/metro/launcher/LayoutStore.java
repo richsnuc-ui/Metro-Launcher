@@ -38,7 +38,12 @@ final class LayoutStore {
 
     static List<String> loadDock(Context c) {
         List<String> out = new ArrayList<>();
-        String s = Prefs.sp(c).getString("dock", "");
+        String s;
+        try {
+            s = Prefs.sp(c).getString("dockApps", "");
+        } catch (Exception e) {
+            s = "";
+        }
         if (!s.isEmpty()) for (String k : s.split("\n")) if (!k.isEmpty()) out.add(k);
         return out;
     }
@@ -53,7 +58,7 @@ final class LayoutStore {
         }
         Prefs.sp(c).edit()
                 .putString("layout", root.toString())
-                .putString("dock", android.text.TextUtils.join("\n", dock))
+                .putString("dockApps", android.text.TextUtils.join("\n", dock))
                 .apply();
     }
 
