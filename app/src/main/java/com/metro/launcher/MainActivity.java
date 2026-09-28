@@ -118,6 +118,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host, DragL
 
     // Widgets
     private AppWidgetHost widgetHost;
+    private final Map<Integer, AppWidgetHostView> widgetViews = new HashMap<>();
     private AppWidgetManager awm;
     private int pendingWidgetId = -1;
     private Section pendingSection;
@@ -164,7 +165,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host, DragL
         getWindow().setNavigationBarColor(Color.TRANSPARENT);
 
         awm = AppWidgetManager.getInstance(this);
-        widgetHost = new AppWidgetHost(this, WIDGET_HOST_ID);
+        widgetHost = new MetroWidgetHost(this, WIDGET_HOST_ID);
         media = new MediaWatcher(this, this::updateLiveTiles);
         NotifService.setOnChange(() -> {
             if (resumed) media.start();
@@ -778,6 +779,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host, DragL
     private void rebuildStart() {
         if (start == null) return;
         start.removeAllViews();
+        widgetViews.clear();
         start.setScale(prefs.scale);
         if (sections != null) {
             for (Section sec : sections) {
@@ -802,7 +804,13 @@ public class MainActivity extends Activity implements AppListAdapter.Host, DragL
             } catch (Exception ignored) {
             }
             if (info != null) {
-                AppWidgetHostView hv = widgetHost.createView(this, s.widgetId, info);
+                // Widgets draw with the system's own theme (like the stock home screen),
+                // not Metro's, so their colors and styles resolve correctly.
+                Context themed = new android.view.ContextThemeWrapper(this,
+                        Build.VERSION.SDK_INT >= 29 ? android.R.style.Theme_DeviceDefault_DayNight
+                                : android.R.style.Theme_DeviceDefault);
+                AppWidgetHostView hv = widgetHost.createView(themed, s.widgetId, info);
+                widgetViews.put(s.widgetId, hv);
                 WidgetTileView wt = new WidgetTileView(this, s, hv);
                 wt.setStyle(tileColor(s), prefs.tileAlpha / 3, prefs.shape);
                 wt.setOnLongClickListener(v -> {
@@ -1028,6 +1036,17 @@ public class MainActivity extends Activity implements AppListAdapter.Host, DragL
         if (s.type == TileSpec.MEDIA || s.type == TileSpec.NOTIFS) {
             labels.add("Notification access settings");
             actions.add(this::showNotifAccessDialog);
+        }
+        if (isWidget) {
+            labels.add("Reload widget");
+            actions.add(this::saveAndRebuild);
+            AppWidgetHostView hv = widgetViews.get(s.widgetId);
+            final Throwable err = hv instanceof MetroWidgetHost.MetroWidgetHostView
+                    ? ((MetroWidgetHost.MetroWidgetHostView) hv).error : null;
+            if (err != null) {
+                labels.add("Show widget error");
+                actions.add(() -> showWidgetError(s, err));
+            }
         }
         labels.add("Unpin from Start");
         actions.add(() -> {
@@ -1307,6 +1326,38 @@ public class MainActivity extends Activity implements AppListAdapter.Host, DragL
         }
         pendingWidgetId = -1;
         pendingSection = null;
+    }
+
+    private void showWidgetError(TileSpec s, Throwable err) {
+        java.io.StringWriter sw = new java.io.StringWriter();
+        err.printStackTrace(new java.io.PrintWriter(sw));
+        AppWidgetProviderInfo info = null;
+        try {
+            info = awm.getAppWidgetInfo(s.widgetId);
+        } catch (Exception ignored) {
+        }
+        final String report = "Metro Launcher " + CrashLog.BuildInfo.version(this) + " widget error\n"
+                + "Device: " + Build.MANUFACTURER + " " + Build.MODEL + ", API " + Build.VERSION.SDK_INT + "\n"
+                + "Widget: " + (info == null ? s.label : info.provider.flattenToShortString()) + "\n\n" + sw;
+        TextView tv = new TextView(this);
+        tv.setText(report);
+        tv.setTextSize(11);
+        tv.setTypeface(Typeface.MONOSPACE);
+        tv.setTextIsSelectable(true);
+        tv.setPadding(dp(20), dp(8), dp(20), dp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(tv);
+        new AlertDialog.Builder(this, DIALOG_THEME)
+                .setTitle("Widget error")
+                .setView(sv)
+                .setPositiveButton("Copy", (d, w) -> {
+                    android.content.ClipboardManager cm =
+                            (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(android.content.ClipData.newPlainText("Metro widget error", report));
+                    toast("Copied");
+                })
+                .setNegativeButton("Close", null)
+                .show();
     }
 
     // ================================================================ notifications folder

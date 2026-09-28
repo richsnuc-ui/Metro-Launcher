@@ -42,12 +42,23 @@ final class WidgetTileView extends FrameLayout implements Tile {
     @SuppressWarnings("deprecation")
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
+        if (w <= 0 || h <= 0) return;
         float d = getResources().getDisplayMetrics().density;
         int wd = Math.round(w / d), hd = Math.round(h / d);
         try {
-            hostView.updateAppWidgetSize(null, wd, hd, wd, hd);
+            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                // Android 12+ widgets pick a layout from the exact sizes the host offers.
+                hostView.updateAppWidgetSize(new android.os.Bundle(),
+                        java.util.Collections.singletonList(new android.util.SizeF(wd, hd)));
+            } else {
+                hostView.updateAppWidgetSize(null, wd, hd, wd, hd);
+            }
         } catch (Exception ignored) {
         }
+    }
+
+    AppWidgetHostView hostView() {
+        return hostView;
     }
 
     /** Widgets eat touches, so watch for a long press here to open the tile menu. */
