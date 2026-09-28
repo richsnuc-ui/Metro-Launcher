@@ -136,6 +136,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     private LocationListener activeLocListener;
     /** True right after a crash: live data stays off until the crash report is dismissed. */
     private boolean safeStart;
+    private boolean crashedAtStart;
     private String crashReport;
 
     // ================================================================ lifecycle
@@ -144,6 +145,14 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     protected void onCreate(Bundle savedInstanceState) {
         CrashLog.install(this);
         super.onCreate(savedInstanceState);
+        // If Metro crashed recently, show the bare report screen instead of Start, so a crash
+        // in Start can't prevent the report from being seen.
+        if (CrashLog.read(this) != null && CrashLog.ageMs(this) < 10 * 60000L) {
+            startActivity(new Intent(this, CrashReportActivity.class));
+            finish();
+            crashedAtStart = true;
+            return;
+        }
         prefs = Prefs.load(this);
         crashReport = CrashLog.read(this);
         safeStart = crashReport != null && CrashLog.ageMs(this) < 10 * 60000L;
@@ -213,6 +222,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     @Override
     protected void onStart() {
         super.onStart();
+        if (crashedAtStart) return;
         try {
             widgetHost.startListening();
         } catch (Exception ignored) {
@@ -222,6 +232,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     @Override
     protected void onStop() {
         super.onStop();
+        if (crashedAtStart) return;
         try {
             widgetHost.stopListening();
         } catch (Exception ignored) {
@@ -231,6 +242,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (crashedAtStart) return;
         try {
             unregisterReceiver(pkgReceiver);
         } catch (Exception ignored) {
@@ -315,6 +327,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     @Override
     protected void onResume() {
         super.onResume();
+        if (crashedAtStart) return;
         resumed = true;
         if (!safeStart) media.start();
         updateLiveTiles();
@@ -338,6 +351,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     @Override
     protected void onPause() {
         super.onPause();
+        if (crashedAtStart) return;
         resumed = false;
         media.stop();
         ui.removeCallbacks(clockTick);
@@ -349,6 +363,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (crashedAtStart) return;
         // Home pressed while already showing: back to the top of Start.
         hideKeyboard();
         if (search != null) search.setText("");
@@ -358,6 +373,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
 
     @Override
     public void onBackPressed() {
+        if (crashedAtStart) return;
         if (host.getPage() == 1) {
             hideKeyboard();
             host.goTo(0, true);
