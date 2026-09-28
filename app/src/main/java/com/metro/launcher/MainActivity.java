@@ -132,13 +132,21 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     private String[] nextEvent;
     private boolean resumed;
     private BroadcastReceiver pkgReceiver;
+    private LocationManager activeLm;
+    private LocationListener activeLocListener;
+    /** True right after a crash: live data stays off until the crash report is dismissed. */
+    private boolean safeStart;
+    private String crashReport;
 
     // ================================================================ lifecycle
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        CrashLog.install(this);
         super.onCreate(savedInstanceState);
         prefs = Prefs.load(this);
+        crashReport = CrashLog.read(this);
+        safeStart = crashReport != null && CrashLog.ageMs(this) < 10 * 60000L;
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
@@ -173,6 +181,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
                 rebuildDock();
             }
             if (!prefs.setupDone) showWelcome();
+            else if (crashReport != null) showCrashReport();
         });
 
         if (!prefs.bingCache.isEmpty()) {
@@ -228,15 +237,86 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
         }
         NotifService.setOnChange(null);
         media.stop();
+        stopLocationUpdates();
         ui.removeCallbacksAndMessages(null);
         bg.shutdownNow();
+    }
+
+    private void stopLocationUpdates() {
+        if (activeLm != null && activeLocListener != null) {
+            try {
+                activeLm.removeUpdates(activeLocListener);
+            } catch (Exception ignored) {
+            }
+        }
+        activeLm = null;
+        activeLocListener = null;
+    }
+
+    /** Runs work off the main thread. Errors are recorded instead of crashing the launcher. */
+    private void runBg(Runnable r) {
+        if (bg.isShutdown()) return;
+        try {
+            bg.execute(() -> {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    CrashLog.note(this, t);
+                }
+            });
+        } catch (Exception ignored) {
+            // Executor already shut down (activity closing): nothing to do.
+        }
+    }
+
+    /** Shows the saved crash report so it can be copied and sent for a fix. */
+    private void showCrashReport() {
+        final String report = crashReport;
+        if (report == null) return;
+        TextView tv = new TextView(this);
+        tv.setText(report);
+        tv.setTextSize(11);
+        tv.setTextIsSelectable(true);
+        tv.setTypeface(Typeface.MONOSPACE);
+        tv.setPadding(dp(20), dp(8), dp(20), dp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(tv);
+        new AlertDialog.Builder(this, DIALOG_THEME)
+                .setTitle("Metro closed unexpectedly")
+                .setMessage("Copy this report and paste it to Claude so it can be fixed. "
+                        + "Weather, calendar and background updates are paused until you dismiss this.")
+                .setView(sv)
+                .setCancelable(false)
+                .setPositiveButton("Copy report", (d, w) -> {
+                    android.content.ClipboardManager cm =
+                            (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (cm != null) {
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("Metro crash report", report));
+                    }
+                    toast("Report copied");
+                    dismissCrashReport();
+                })
+                .setNegativeButton("Dismiss", (d, w) -> dismissCrashReport())
+                .show();
+    }
+
+    private void dismissCrashReport() {
+        CrashLog.clear(this);
+        crashReport = null;
+        if (safeStart) {
+            safeStart = false;
+            media.start();
+            refreshWeather(true);
+            refreshCalendar();
+            refreshBing(false);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         resumed = true;
-        media.start();
+        if (!safeStart) media.start();
         updateLiveTiles();
         ui.removeCallbacks(clockTick);
         ui.removeCallbacks(flipTick);
@@ -289,8 +369,12 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode == REQ_PERMS) {
-            refreshWeather(true);
-            refreshCalendar();
+            try {
+                refreshWeather(true);
+                refreshCalendar();
+            } catch (Exception e) {
+                CrashLog.note(this, e);
+            }
             if (!prefs.askedRole) {
                 prefs.askedRole = true;
                 prefs.save(this);
@@ -511,7 +595,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     // ================================================================ apps & icons
 
     private void loadApps(Runnable after) {
-        bg.execute(() -> {
+        runBg(() -> {
             List<AppInfo> list = AppInfo.loadAll(this);
             ui.post(() -> {
                 apps.clear();
@@ -1715,6 +1799,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
                 ? NotifService.items() : new ArrayList<StatusBarNotification>();
 
         forEachTileView(t -> {
+          try {
             switch (t.spec.type) {
                 case TileSpec.CLOCK:
                     t.setFaces(time, weekday, monthDay, dayNum, monthYear, alarm, true);
@@ -1777,6 +1862,9 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
                 default:
                     break;
             }
+          } catch (Exception e) {
+            CrashLog.note(this, e);
+          }
         });
     }
 
@@ -1793,8 +1881,8 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     }
 
     private void refreshCalendar() {
-        if (!hasLiveTile(TileSpec.CALENDAR)) return;
-        bg.execute(() -> {
+        if (safeStart || !hasLiveTile(TileSpec.CALENDAR)) return;
+        runBg(() -> {
             String[] ev = CalendarReader.next(this);
             ui.post(() -> {
                 nextEvent = ev;
@@ -1806,6 +1894,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     // ================================================================ weather
 
     private void refreshWeather(boolean force) {
+        if (safeStart) return;
         long now = System.currentTimeMillis();
         if (!force && now - lastWeather < 30 * 60000L) return;
         if (!hasLiveTile(TileSpec.WEATHER)) return;
@@ -1813,7 +1902,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
 
         if (!prefs.city.isEmpty()) {
             final String cityQuery = prefs.city;
-            bg.execute(() -> {
+            runBg(() -> {
                 try {
                     if (Double.isNaN(prefs.cityLat)) {
                         WeatherClient.Place p = WeatherClient.geocode(cityQuery);
@@ -1843,40 +1932,54 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
         final LocationManager lm = (LocationManager) getSystemService(LOCATION_SERVICE);
         if (lm == null) return;
         Location best = null;
-        for (String p : lm.getProviders(true)) {
+        List<String> providers;
+        try {
+            providers = lm.getProviders(true);
+        } catch (Exception e) {
+            providers = new ArrayList<>();
+        }
+        for (String p : providers) {
             try {
                 Location l = lm.getLastKnownLocation(p);
                 if (l != null && (best == null || l.getTime() > best.getTime())) best = l;
-            } catch (SecurityException ignored) {
+            } catch (Exception ignored) {
+                // e.g. "gps" when only approximate location was allowed
             }
         }
         if (best != null && now - best.getTime() < 3 * 3600000L) {
             final Location b = best;
-            bg.execute(() -> fetchWeatherAt(b.getLatitude(), b.getLongitude(), null));
+            runBg(() -> fetchWeatherAt(b.getLatitude(), b.getLongitude(), null));
             return;
         }
-        String provider = lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-                ? LocationManager.NETWORK_PROVIDER
-                : lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ? LocationManager.GPS_PROVIDER : null;
+        String provider = null;
+        try {
+            if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) provider = LocationManager.NETWORK_PROVIDER;
+            else if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                    && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED) provider = LocationManager.GPS_PROVIDER;
+        } catch (Exception ignored) {
+        }
         final Location fallback = best;
         if (provider == null) {
             if (fallback != null) {
-                bg.execute(() -> fetchWeatherAt(fallback.getLatitude(), fallback.getLongitude(), null));
+                runBg(() -> fetchWeatherAt(fallback.getLatitude(), fallback.getLongitude(), null));
             } else {
                 weatherStatus = "Turn on location or set a city";
                 updateLiveTiles();
             }
             return;
         }
+        stopLocationUpdates();
         try {
             final boolean[] done = {false};
             final LocationListener ll = new LocationListener() {
                 @Override
                 public void onLocationChanged(Location l) {
-                    lm.removeUpdates(this);
-                    if (done[0]) return;
+                    stopLocationUpdates();
+                    if (done[0] || l == null) return;
                     done[0] = true;
-                    bg.execute(() -> fetchWeatherAt(l.getLatitude(), l.getLongitude(), null));
+                    final double lat = l.getLatitude(), lon = l.getLongitude();
+                    runBg(() -> fetchWeatherAt(lat, lon, null));
                 }
 
                 @Override
@@ -1891,22 +1994,29 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
                 public void onProviderDisabled(String p) {
                 }
             };
+            activeLm = lm;
+            activeLocListener = ll;
             lm.requestLocationUpdates(provider, 0, 0, ll, Looper.getMainLooper());
             ui.postDelayed(() -> {
-                lm.removeUpdates(ll);
+                if (activeLocListener == ll) stopLocationUpdates();
                 if (done[0]) return;
                 done[0] = true;
                 if (fallback != null) {
-                    bg.execute(() -> fetchWeatherAt(fallback.getLatitude(), fallback.getLongitude(), null));
+                    runBg(() -> fetchWeatherAt(fallback.getLatitude(), fallback.getLongitude(), null));
                 } else {
                     lastWeather = 0;
                     weatherStatus = "Location unavailable";
                     updateLiveTiles();
                 }
             }, 30000);
-        } catch (SecurityException e) {
-            weatherStatus = "Set a city in settings";
-            updateLiveTiles();
+        } catch (Exception e) {
+            stopLocationUpdates();
+            if (fallback != null) {
+                runBg(() -> fetchWeatherAt(fallback.getLatitude(), fallback.getLongitude(), null));
+            } else {
+                weatherStatus = "Set a city in settings";
+                updateLiveTiles();
+            }
         }
     }
 
@@ -1957,6 +2067,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     }
 
     private void refreshBing(boolean force) {
+        if (safeStart) return;
         if (!prefs.bing) {
             bgA.setImageDrawable(null);
             bgB.setImageDrawable(null);
@@ -1967,7 +2078,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
             if (!hasBackground()) showBing(bingIndex);
             return;
         }
-        bg.execute(() -> {
+        runBg(() -> {
             try {
                 List<String> urls = BingClient.fetch();
                 if (urls.isEmpty()) return;
@@ -2002,7 +2113,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
         final String url = bingUrls.get(index);
         final File cacheDir = getCacheDir();
         final DisplayMetrics dm = getResources().getDisplayMetrics();
-        bg.execute(() -> {
+        runBg(() -> {
             try {
                 File f = BingClient.cacheFile(cacheDir, url);
                 if (!f.exists()) Util.download(url, f);
