@@ -45,6 +45,7 @@ import android.text.TextWatcher;
 import android.text.format.DateFormat;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.DecelerateInterpolator;
@@ -84,7 +85,7 @@ import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
-public class MainActivity extends Activity implements AppListAdapter.Host {
+public class MainActivity extends Activity implements AppListAdapter.Host, DragLayer.Handler {
     private static final int DIALOG_THEME = android.R.style.Theme_DeviceDefault_Dialog_Alert;
     private static final int REQ_PERMS = 1, REQ_HOME = 2, REQ_BIND = 3, REQ_CONFIG = 4;
     private static final int WIDGET_HOST_ID = 0x4D45;
@@ -103,7 +104,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     private final List<AppInfo> apps = new ArrayList<>();
 
     // Views
-    private FrameLayout root;
+    private DragLayer root;
     private ImageView bgA, bgB;
     private boolean bgAFront = true;
     private SwipeHost host;
@@ -352,6 +353,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     protected void onPause() {
         super.onPause();
         if (crashedAtStart) return;
+        finishDrag(false);
         resumed = false;
         media.stop();
         ui.removeCallbacks(clockTick);
@@ -418,7 +420,8 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
     }
 
     private void buildUi() {
-        root = new FrameLayout(this);
+        root = new DragLayer(this);
+        root.setHandler(this);
         root.setBackgroundColor(Color.BLACK);
 
         bgA = makeBackground();
@@ -803,7 +806,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
                 WidgetTileView wt = new WidgetTileView(this, s, hv);
                 wt.setStyle(tileColor(s), prefs.tileAlpha / 3, prefs.shape);
                 wt.setOnLongClickListener(v -> {
-                    showTileMenu(s);
+                    startDrag(v, s);
                     return true;
                 });
                 return wt;
@@ -817,7 +820,7 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
         tv.setStyle(tileColor(s), prefs.tileAlpha, prefs.shape);
         tv.setOnClickListener(v -> onTileClick(s));
         tv.setOnLongClickListener(v -> {
-            showTileMenu(s);
+            startDrag(v, s);
             return true;
         });
         return tv;
@@ -1371,6 +1374,187 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
         }
     }
 
+    // ================================================================ drag to move tiles
+
+    private boolean dragging, dragMoved;
+    private TileSpec dragSpec;
+    private View dragSrc;
+    private ImageView dragGhost;
+    private View dropMark;
+    private float grabX, grabY, dragStartX, dragStartY;
+    private Section dropSection;
+    private TileSpec dropTarget;
+    private boolean dropAfter;
+    private int edgeDir;
+    private final int[] tmpLoc = new int[2];
+
+    @Override
+    public boolean dragActive() {
+        return dragging;
+    }
+
+    /** Press and hold a tile: it lifts off and follows your finger. Let go without moving for the menu. */
+    private void startDrag(View v, TileSpec s) {
+        if (dragging || host.getPage() != 0 || v.getWidth() == 0) return;
+        dragging = true;
+        dragMoved = false;
+        dragSpec = s;
+        dragSrc = v;
+        try {
+            v.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+        } catch (Exception ignored) {
+        }
+
+        Bitmap bm = null;
+        try {
+            bm = Bitmap.createBitmap(v.getWidth(), v.getHeight(), Bitmap.Config.ARGB_8888);
+            v.draw(new android.graphics.Canvas(bm));
+        } catch (Throwable ignored) {
+        }
+        int[] rootLoc = new int[2];
+        root.getLocationOnScreen(rootLoc);
+        v.getLocationOnScreen(tmpLoc);
+        grabX = root.lastRawX - tmpLoc[0];
+        grabY = root.lastRawY - tmpLoc[1];
+        dragStartX = root.lastRawX;
+        dragStartY = root.lastRawY;
+
+        dragGhost = new ImageView(this);
+        if (bm != null) dragGhost.setImageBitmap(bm);
+        else dragGhost.setBackgroundColor(tileColor(s));
+        Tile.applyShape(dragGhost, prefs.shape);
+        root.addView(dragGhost, new FrameLayout.LayoutParams(v.getWidth(), v.getHeight()));
+        dragGhost.setX(tmpLoc[0] - rootLoc[0]);
+        dragGhost.setY(tmpLoc[1] - rootLoc[1]);
+        dragGhost.setElevation(dp(16));
+        dragGhost.animate().scaleX(1.07f).scaleY(1.07f).alpha(0.92f).setDuration(120).start();
+
+        dropMark = new View(this);
+        dropMark.setBackgroundColor(prefs.colorMode == Prefs.COLOR_COLORFUL ? Color.WHITE : prefs.accent);
+        dropMark.setVisibility(View.GONE);
+        root.addView(dropMark, new FrameLayout.LayoutParams(dp(4), dp(10)));
+
+        v.setAlpha(0.25f);
+    }
+
+    @Override
+    public void onDragTouch(MotionEvent ev) {
+        float x = ev.getRawX(), y = ev.getRawY();
+        switch (ev.getActionMasked()) {
+            case MotionEvent.ACTION_MOVE: {
+                if (!dragMoved && Math.hypot(x - dragStartX, y - dragStartY) > dp(12)) dragMoved = true;
+                moveGhost(x, y);
+                int[] rootLoc = new int[2];
+                root.getLocationOnScreen(rootLoc);
+                float ry = y - rootLoc[1];
+                int zone = dp(90);
+                int newDir = ry < zone ? -1 : ry > root.getHeight() - zone ? 1 : 0;
+                if (newDir != 0 && edgeDir == 0) {
+                    edgeDir = newDir;
+                    ui.post(autoScroll);
+                } else {
+                    edgeDir = newDir;
+                }
+                if (dragMoved) findDropTarget(x, y);
+                break;
+            }
+            case MotionEvent.ACTION_UP:
+                finishDrag(true);
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                finishDrag(false);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private final Runnable autoScroll = new Runnable() {
+        @Override
+        public void run() {
+            if (!dragging || edgeDir == 0) return;
+            startScroll.scrollBy(0, edgeDir * dp(14));
+            if (dragMoved) findDropTarget(root.lastRawX, root.lastRawY);
+            ui.postDelayed(this, 16);
+        }
+    };
+
+    private void moveGhost(float rawX, float rawY) {
+        if (dragGhost == null) return;
+        int[] rootLoc = new int[2];
+        root.getLocationOnScreen(rootLoc);
+        dragGhost.setX(rawX - rootLoc[0] - grabX);
+        dragGhost.setY(rawY - rootLoc[1] - grabY);
+    }
+
+    /** Works out where the tile would land: before/after the tile under the finger, or end of a section. */
+    private void findDropTarget(float rawX, float rawY) {
+        dropSection = null;
+        dropTarget = null;
+        dropAfter = false;
+        int[] rootLoc = new int[2];
+        root.getLocationOnScreen(rootLoc);
+        for (int i = 0; i < start.getChildCount(); i++) {
+            View c = start.getChildAt(i);
+            if (!(c instanceof SectionView)) continue;
+            SectionView sv = (SectionView) c;
+            sv.getLocationOnScreen(tmpLoc);
+            if (rawX < tmpLoc[0] - dp(18) || rawX > tmpLoc[0] + sv.getWidth() + dp(18)
+                    || rawY < tmpLoc[1] || rawY > tmpLoc[1] + sv.getHeight() + dp(24)) continue;
+            dropSection = sv.section;
+            TileGridView g = sv.grid;
+            for (int j = 0; j < g.getChildCount(); j++) {
+                View t = g.getChildAt(j);
+                if (t == dragSrc) continue;
+                t.getLocationOnScreen(tmpLoc);
+                if (rawX >= tmpLoc[0] && rawX <= tmpLoc[0] + t.getWidth()
+                        && rawY >= tmpLoc[1] && rawY <= tmpLoc[1] + t.getHeight()) {
+                    dropTarget = ((Tile) t).spec();
+                    dropAfter = rawX > tmpLoc[0] + t.getWidth() / 2f;
+                    FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) dropMark.getLayoutParams();
+                    lp.height = t.getHeight();
+                    dropMark.setLayoutParams(lp);
+                    float mx = dropAfter ? tmpLoc[0] + t.getWidth() + dp(1) : tmpLoc[0] - dp(5);
+                    dropMark.setX(mx - rootLoc[0]);
+                    dropMark.setY(tmpLoc[1] - rootLoc[1]);
+                    dropMark.setVisibility(View.VISIBLE);
+                    return;
+                }
+            }
+            dropMark.setVisibility(View.GONE); // empty space in a section: goes to its end
+            return;
+        }
+        dropMark.setVisibility(View.GONE);
+    }
+
+    private void finishDrag(boolean drop) {
+        if (!dragging) return;
+        dragging = false;
+        edgeDir = 0;
+        ui.removeCallbacks(autoScroll);
+        final TileSpec s = dragSpec;
+        boolean changed = false;
+        if (drop && dragMoved && dropSection != null && dropTarget != s) {
+            Section from = sectionOf(s);
+            if (from != null) {
+                from.tiles.remove(s);
+                int idx = dropTarget == null ? -1 : dropSection.tiles.indexOf(dropTarget);
+                if (idx < 0) dropSection.tiles.add(s);
+                else dropSection.tiles.add(dropAfter ? idx + 1 : idx, s);
+                changed = true;
+            }
+        }
+        if (dragGhost != null) root.removeView(dragGhost);
+        if (dropMark != null) root.removeView(dropMark);
+        dragGhost = null;
+        dropMark = null;
+        if (dragSrc != null) dragSrc.setAlpha(1f);
+        dragSrc = null;
+        dragSpec = null;
+        if (changed) saveAndRebuild();
+        else if (drop && !dragMoved && s != null) showTileMenu(s);
+    }
+
     // ================================================================ letter jump & colors
 
     /** Windows Phone style letter grid: tap a letter header to jump. */
@@ -1615,7 +1799,8 @@ public class MainActivity extends Activity implements AppListAdapter.Host {
             box.addView(button("Notification access (Music & Notifications tiles)", v -> showNotifAccessDialog()));
             box.addView(button("Make Metro my home screen", v -> requestHomeRole(false)));
             box.addView(button("Reset Start layout…", v -> confirmReset()));
-            box.addView(note("Tips: press and hold a tile to resize, recolor, move or unpin it. "
+            box.addView(note("Tips: press and hold a tile, then drag it to move it (even into another section). "
+                    + "Press and hold and let go to resize, recolor or unpin it. "
                     + "Press and hold a section name to rename, move or add to it. "
                     + "Swipe left (or tap →) for all apps; press and hold an app to pin it or add it to the dock."));
         }

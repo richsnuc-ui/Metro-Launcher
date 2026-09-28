@@ -56,7 +56,8 @@ and on-device AI summaries (Gemini Nano access is limited to approved apps).
 
 ## Using it
 
-- **Press and hold a tile**: resize, recolor, move, move to another section, or unpin
+- **Press and hold a tile, then drag**: move it anywhere, including into another section
+- **Press and hold a tile and let go**: resize, recolor, or unpin
 - **Press and hold a section name** (or the thin strip above an unnamed section): rename, move, add to it, delete
 - **+ button** at the bottom of Start: add an app tile, Android widget, live tile, or new section
 - **••• button**: all settings
